@@ -40,6 +40,8 @@ impl Numeric {
     /// Extract the decimal part.
     pub fn dec_part(self) -> i128 {
         let scale = self.pow_scale();
+        // Use modulo and abs to ensure decimal part is always positive
+        // Example: -726428401 with scale 4 gives 8401, not -840
         (self.value % scale).abs()
     }
 
@@ -188,7 +190,7 @@ impl Debug for Numeric {
             f,
             "{}.{:0pad$}",
             self.int_part(),
-            self.dec_part(), // Now always positive due to dec_part() fix
+            self.dec_part(), // Always positive now - prevents "-72642.-8401" format
             pad = self.scale as usize
         )
     }
