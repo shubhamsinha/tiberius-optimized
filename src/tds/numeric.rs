@@ -40,7 +40,7 @@ impl Numeric {
     /// Extract the decimal part.
     pub fn dec_part(self) -> i128 {
         let scale = self.pow_scale();
-        self.value - (self.value / scale) * scale
+        (self.value % scale).abs()
     }
 
     /// Extract the integer part.
@@ -188,7 +188,7 @@ impl Debug for Numeric {
             f,
             "{}.{:0pad$}",
             self.int_part(),
-            self.dec_part(),
+            self.dec_part(), // Now always positive due to dec_part() fix
             pad = self.scale as usize
         )
     }
