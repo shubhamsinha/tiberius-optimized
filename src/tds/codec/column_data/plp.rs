@@ -1,10 +1,10 @@
-use futures_util::AsyncReadExt;
 use crate::sql_read_bytes::SqlReadBytes;
+use futures_util::AsyncReadExt;
 
 // Decode a partially length-prefixed type.
 pub(crate) async fn decode<R>(src: &mut R, len: usize) -> crate::Result<Option<Vec<u8>>>
-    where
-        R: SqlReadBytes + Unpin,
+where
+    R: SqlReadBytes + Unpin,
 {
     match len {
         // Fixed size
@@ -20,7 +20,7 @@ pub(crate) async fn decode<R>(src: &mut R, len: usize) -> crate::Result<Option<V
                     //     data.push(src.read_u8().await?);
                     // }
 
-                    let mut data= vec![0; len as usize];
+                    let mut data = vec![0; len as usize];
                     src.read(&mut data).await?;
 
                     Ok(Some(data))
