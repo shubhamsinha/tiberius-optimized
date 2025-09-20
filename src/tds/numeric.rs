@@ -187,19 +187,25 @@ impl Encode<BytesMut> for Numeric {
 impl Debug for Numeric {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result<(), fmt::Error> {
         let int_part = self.int_part();
-        let dec_part = self.dec_part();
 
-        // Special case: negative value with zero integer part
-        if self.value < 0 && int_part == 0 {
-            write!(f, "-0.{:0pad$}", dec_part, pad = self.scale as usize)
+        // If scale is 0, just print the integer value without decimal point
+        if self.scale == 0 {
+            write!(f, "{}", int_part)
         } else {
-            write!(
-                f,
-                "{}.{:0pad$}",
-                int_part,
-                dec_part, // Always positive now - prevents "-72642.-8401" format
-                pad = self.scale as usize
-            )
+            let dec_part = self.dec_part();
+
+            // Special case: negative value with zero integer part
+            if self.value < 0 && int_part == 0 {
+                write!(f, "-0.{:0pad$}", dec_part, pad = self.scale as usize)
+            } else {
+                write!(
+                    f,
+                    "{}.{:0pad$}",
+                    int_part,
+                    dec_part, // Always positive now - prevents "-72642.-8401" format
+                    pad = self.scale as usize
+                )
+            }
         }
     }
 }
