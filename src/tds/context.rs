@@ -16,7 +16,7 @@ impl Context {
     pub fn new() -> Context {
         Context {
             version: FeatureLevel::SqlServerN,
-            packet_size: 4096,
+            packet_size: 8000,
             packet_id: 0,
             transaction_desc: [0; 8],
             last_meta: None,

@@ -178,7 +178,7 @@ pub struct LoginMessage<'a> {
 impl<'a> LoginMessage<'a> {
     pub fn new() -> LoginMessage<'a> {
         Self {
-            packet_size: 4096,
+            packet_size: 8000,
             option_flags_1: OptionFlag1::UseDbNotify | OptionFlag1::InitDbFatal,
             option_flags_2: OptionFlag2::InitLangFatal | OptionFlag2::OdbcDriver,
             option_flags_3: BitFlags::from_flag(OptionFlag3::UnknownCollationHandling),
