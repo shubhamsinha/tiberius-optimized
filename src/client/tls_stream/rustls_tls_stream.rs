@@ -114,6 +114,16 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> TlsStream<S> {
                     });
                 }
             }
+            TrustConfig::CaCertificatePem(pem_bytes) => {
+                let pem_certs = rustls_pemfile::certs(&mut pem_bytes.as_slice())?;
+                let mut cert_store = RootCertStore::empty();
+                for cert_der in pem_certs {
+                    cert_store.add(&Certificate(cert_der))?;
+                }
+                builder
+                    .with_root_certificates(cert_store)
+                    .with_no_client_auth()
+            }
             TrustConfig::TrustAll => {
                 event!(
                     Level::WARN,

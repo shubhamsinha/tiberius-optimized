@@ -41,6 +41,10 @@ pub(crate) async fn create_tls_stream<S: AsyncRead + AsyncWrite + Unpin + Send>(
                 });
             }
         }
+        TrustConfig::CaCertificatePem(pem_bytes) => {
+            let cert = Certificate::from_pem(pem_bytes)?;
+            builder = builder.add_root_certificate(cert);
+        }
         TrustConfig::TrustAll => {
             event!(
                 Level::WARN,

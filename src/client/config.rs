@@ -38,6 +38,7 @@ pub struct Config {
 pub(crate) enum TrustConfig {
     #[allow(dead_code)]
     CaCertificateLocation(PathBuf),
+    CaCertificatePem(Vec<u8>),
     TrustAll,
     Default,
 }
@@ -155,6 +156,13 @@ impl Config {
         } else {
             self.trust = TrustConfig::CaCertificateLocation(PathBuf::from(path.to_string()))
         }
+    }
+
+    /// If set, the server certificate will be validated against the given PEM-encoded
+    /// CA certificate bytes. No file I/O is performed — the certificate is loaded
+    /// directly from memory.
+    pub fn trust_cert_ca_pem(&mut self, pem_bytes: impl Into<Vec<u8>>) {
+        self.trust = TrustConfig::CaCertificatePem(pem_bytes.into());
     }
 
     /// Sets the authentication method.
