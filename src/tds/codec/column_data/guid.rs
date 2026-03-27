@@ -1,3 +1,4 @@
+use futures_util::io::AsyncReadExt;
 use uuid::Uuid;
 
 use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::codec::guid, ColumnData};
@@ -12,11 +13,7 @@ where
         0 => ColumnData::Guid(None),
         16 => {
             let mut data = [0u8; 16];
-
-            for item in &mut data {
-                *item = src.read_u8().await?;
-            }
-
+            src.read_exact(&mut data).await?;
             guid::reorder_bytes(&mut data);
             ColumnData::Guid(Some(Uuid::from_bytes(data)))
         }
