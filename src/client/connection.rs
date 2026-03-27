@@ -85,7 +85,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
             transport,
             context,
             flushed: false,
-            buf: BytesMut::new(),
+            buf: BytesMut::with_capacity(65536),
         };
 
         let fed_auth_required = matches!(config.auth, AuthMethod::AADToken(_));
@@ -466,7 +466,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 transport,
                 context,
                 flushed: false,
-                buf: BytesMut::new(),
+                buf: BytesMut::with_capacity(65536),
             })
         } else {
             event!(
