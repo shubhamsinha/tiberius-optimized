@@ -2,6 +2,7 @@
 
 use super::codec::Encode;
 use crate::{sql_read_bytes::SqlReadBytes, Error};
+use futures_util::io::AsyncReadExt;
 #[cfg(feature = "bigdecimal")]
 #[cfg_attr(feature = "docs", doc(cfg(feature = "bigdecimal")))]
 pub use bigdecimal::{num_bigint::BigInt, BigDecimal};
@@ -133,17 +134,13 @@ impl Numeric {
                 5 => src.read_u32_le().await? as i128 * sign,
                 9 => src.read_u64_le().await? as i128 * sign,
                 13 => {
-                    let mut bytes = [0u8; 12]; //u96
-                    for item in &mut bytes {
-                        *item = src.read_u8().await?;
-                    }
+                    let mut bytes = [0u8; 12];
+                    src.read_exact(&mut bytes).await?;
                     decode_d128(&bytes) as i128 * sign
                 }
                 17 => {
                     let mut bytes = [0u8; 16];
-                    for item in &mut bytes {
-                        *item = src.read_u8().await?;
-                    }
+                    src.read_exact(&mut bytes).await?;
                     decode_d128(&bytes) as i128 * sign
                 }
                 x => {

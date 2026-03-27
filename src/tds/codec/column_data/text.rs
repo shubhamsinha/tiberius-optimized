@@ -1,4 +1,5 @@
 use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::Collation, ColumnData};
+use futures_util::io::AsyncReadExt;
 
 pub(crate) async fn decode<R>(
     src: &mut R,
@@ -13,39 +14,35 @@ where
         return Ok(ColumnData::String(None));
     }
 
-    for _ in 0..ptr_len {
-        src.read_u8().await?;
-    }
+    let mut skip = vec![0u8; ptr_len];
+    src.read_exact(&mut skip).await?;
 
-    src.read_i32_le().await?; // days
-    src.read_u32_le().await?; // second fractions
+    src.read_i32_le().await?;
+    src.read_u32_le().await?;
 
     let text = match collation {
-        // TEXT
         Some(collation) => {
             let encoder = collation.encoding()?;
             let text_len = src.read_u32_le().await? as usize;
-            let mut buf = Vec::with_capacity(text_len);
-
-            for _ in 0..text_len {
-                buf.push(src.read_u8().await?);
-            }
+            let mut buf = vec![0u8; text_len];
+            src.read_exact(&mut buf).await?;
 
             encoder
                 .decode_without_bom_handling_and_without_replacement(buf.as_ref())
                 .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
                 .to_string()
         }
-        // NTEXT
         None => {
-            let text_len = src.read_u32_le().await? as usize / 2;
-            let mut buf = Vec::with_capacity(text_len);
+            let byte_len = src.read_u32_le().await? as usize;
+            let mut buf = vec![0u8; byte_len];
+            src.read_exact(&mut buf).await?;
 
-            for _ in 0..text_len {
-                buf.push(src.read_u16_le().await?);
-            }
+            let u16_buf: Vec<u16> = buf
+                .chunks_exact(2)
+                .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                .collect();
 
-            String::from_utf16(&buf[..])?
+            String::from_utf16(&u16_buf)?
         }
     };
 

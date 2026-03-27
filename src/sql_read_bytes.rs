@@ -14,7 +14,7 @@ macro_rules! varchar_reader {
                 #[pin]
                 src: R,
                 length: Option<usize>,
-                buf: Option<Vec<u16>>,
+                buf: Option<Vec<u8>>,
                 read: usize
             }
         }
@@ -40,7 +40,6 @@ macro_rules! varchar_reader {
             fn poll(self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<Self::Output> {
                 let mut me = self.project();
 
-                // We must know the length of the string first.
                 while me.length.is_none() {
                     let mut read_len = $length_reader::new(&mut me.src);
 
@@ -48,45 +47,39 @@ macro_rules! varchar_reader {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
                         Poll::Ready(Ok(length)) => {
-                            *me.length = Some(length as usize);
-                            *me.buf = Some(Vec::with_capacity(length as usize));
+                            let byte_len = length as usize * 2;
+                            *me.length = Some(byte_len);
+                            *me.buf = Some(vec![0u8; byte_len]);
                         }
                     }
                 }
 
-                // We've set the length and initialized the buffer
                 let len = me.length.unwrap();
                 let buf = me.buf.as_mut().unwrap();
 
-                // Everything's read, we can return the string.
-                if *me.read == len {
-                    let s = String::from_utf16(&buf).map_err(|_| {
-                        io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-16 data.")
-                    })?;
-
-                    return Poll::Ready(Ok(s));
+                if len == 0 {
+                    return Poll::Ready(Ok(String::new()));
                 }
 
-                // Read the utf-16 data
                 while *me.read < len {
-                    let mut read_u16 = ReadU16Le::new(&mut me.src);
-
-                    match Pin::new(&mut read_u16).poll(cx) {
+                    match me.src.as_mut().poll_read(cx, &mut buf[*me.read..]) {
                         Poll::Pending => return Poll::Pending,
                         Poll::Ready(Err(e)) => return Poll::Ready(Err(e.into())),
-                        Poll::Ready(Ok(n)) => {
-                            buf.push(n);
-                            *me.read += 1;
-                        }
+                        Poll::Ready(Ok(0)) => return Poll::Ready(Err(UnexpectedEof.into())),
+                        Poll::Ready(Ok(n)) => *me.read += n,
                     }
                 }
 
-                // Everything's read, we can return the string.
-                let s = String::from_utf16(&buf).map_err(|_| {
+                let u16_buf: Vec<u16> = buf
+                    .chunks_exact(2)
+                    .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
+                    .collect();
+
+                let s = String::from_utf16(&u16_buf).map_err(|_| {
                     io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-16 data.")
                 })?;
 
-                return Poll::Ready(Ok(s));
+                Poll::Ready(Ok(s))
             }
         }
     };
