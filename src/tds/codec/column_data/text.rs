@@ -1,4 +1,4 @@
-use crate::{error::Error, sql_read_bytes::SqlReadBytes, tds::Collation, ColumnData};
+use crate::{sql_read_bytes::SqlReadBytes, tds::Collation, ColumnData};
 use futures_util::io::AsyncReadExt;
 
 pub(crate) async fn decode<R>(
@@ -27,10 +27,8 @@ where
             let mut buf = vec![0u8; text_len];
             src.read_exact(&mut buf).await?;
 
-            encoder
-                .decode_without_bom_handling_and_without_replacement(buf.as_ref())
-                .ok_or_else(|| Error::Encoding("invalid sequence".into()))?
-                .to_string()
+            let (s, _) = encoder.decode_without_bom_handling(buf.as_ref());
+            s.into_owned()
         }
         None => {
             let byte_len = src.read_u32_le().await? as usize;
