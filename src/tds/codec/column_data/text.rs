@@ -42,7 +42,7 @@ where
                 .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                 .collect();
 
-            String::from_utf16(&u16_buf)?
+            String::from_utf16_lossy(&u16_buf)
         }
     };
 

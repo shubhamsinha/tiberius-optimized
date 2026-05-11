@@ -75,9 +75,7 @@ macro_rules! varchar_reader {
                     .map(|chunk| u16::from_le_bytes([chunk[0], chunk[1]]))
                     .collect();
 
-                let s = String::from_utf16(&u16_buf).map_err(|_| {
-                    io::Error::new(io::ErrorKind::InvalidData, "Invalid UTF-16 data.")
-                })?;
+                let s = String::from_utf16_lossy(&u16_buf);
 
                 Poll::Ready(Ok(s))
             }

@@ -37,7 +37,7 @@ where
             }
 
             let buf: Vec<_> = buf.chunks(2).map(LittleEndian::read_u16).collect();
-            Ok(Some(String::from_utf16(&buf)?.into()))
+            Ok(Some(String::from_utf16_lossy(&buf).into()))
         }
         _ => Ok(None),
     }
