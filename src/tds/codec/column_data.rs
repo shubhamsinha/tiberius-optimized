@@ -315,7 +315,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         return Err(crate::Error::Encoding("unrepresentable character".into()));
                     }
 
-                    if bytes.len() > vlc.len() {
+                    let is_max = vlc.r#type() == VarLenType::BigVarChar && vlc.len() == 0xffff;
+
+                    if !is_max && bytes.len() > vlc.len() {
                         return Err(crate::Error::BulkInput(
                             format!(
                                 "Encoded string length {} exceed column limit {}",
@@ -398,7 +400,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                         let length = dst.len() - len_pos - 4;
 
-                        if length > vlc.len() {
+                        let is_max = vlc.r#type() == VarLenType::NVarchar && vlc.len() == 0xffff;
+
+                        if !is_max && length > vlc.len() {
                             return Err(crate::Error::BulkInput(
                                 format!(
                                     "Encoded string length {} exceed column limit {}",
@@ -484,7 +488,9 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     || vlc.r#type() == VarLenType::BigVarBin =>
             {
                 if let Some(bytes) = opt {
-                    if bytes.len() > vlc.len() {
+                    let is_max = vlc.r#type() == VarLenType::BigVarBin && vlc.len() == 0xffff;
+
+                    if !is_max && bytes.len() > vlc.len() {
                         return Err(crate::Error::BulkInput(
                             format!(
                                 "Binary length {} exceed column limit {}",
@@ -1048,10 +1054,36 @@ mod tests {
         test_round_trip(
             TypeInfo::VarLenSized(VarLenContext::new(
                 VarLenType::BigVarChar,
-                0x8ffff,
+                0xffff,
                 Some(Collation::new(13632521, 52)),
             )),
             ColumnData::String(Some("".into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn max_bigvarchar_accepts_encoded_value_above_u16_limit() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigVarChar,
+                0xffff,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("a".repeat(0x10000).into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn none_string_with_max_bigvarchar() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigVarChar,
+                0xffff,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(None),
         )
         .await;
     }
@@ -1087,10 +1119,36 @@ mod tests {
         test_round_trip(
             TypeInfo::VarLenSized(VarLenContext::new(
                 VarLenType::NVarchar,
-                0x8ffff,
+                0xffff,
                 Some(Collation::new(13632521, 52)),
             )),
             ColumnData::String(Some("".into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn max_nvarchar_accepts_utf16_value_above_u16_limit() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                0xffff,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("漢".repeat(0x8000).into())),
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn none_string_with_max_nvarchar() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                0xffff,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(None),
         )
         .await;
     }
@@ -1204,14 +1262,43 @@ mod tests {
     #[tokio::test]
     async fn empty_binary_with_varlen_bigvarbin() {
         test_round_trip(
-            TypeInfo::VarLenSized(VarLenContext::new(
-                VarLenType::BigVarBin,
-                0x8ffff,
-                Some(Collation::new(13632521, 52)),
-            )),
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None)),
             ColumnData::Binary(Some(b"".as_slice().into())),
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn max_bigvarbin_accepts_values_at_and_above_u16_limit() {
+        for len in [0xffff, 0x10000] {
+            test_round_trip(
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None)),
+                ColumnData::Binary(Some(vec![42; len].into())),
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn none_binary_with_max_bigvarbin() {
+        test_round_trip(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 0xffff, None)),
+            ColumnData::Binary(None),
+        )
+        .await;
+    }
+
+    #[test]
+    fn regular_bigvarbin_rejects_value_above_declared_size() {
+        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 40, None));
+        let mut buf = BytesMut::new();
+        let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+
+        let err = ColumnData::Binary(Some(vec![42; 41].into()))
+            .encode(&mut buf_with_ti)
+            .expect_err("value above the declared size must fail");
+
+        assert!(matches!(err, Error::BulkInput(_)));
     }
 
     #[tokio::test]
