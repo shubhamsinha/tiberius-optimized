@@ -22,7 +22,7 @@ mod time;
 mod var_len;
 mod xml;
 
-use super::{Encode, FixedLenType, TypeInfo, VarLenType};
+use super::{Encode, FixedLenType, TypeInfo, VarLenContext, VarLenType};
 #[cfg(feature = "tds73")]
 use crate::tds::time::{Date, DateTime2, DateTimeOffset, Time};
 use crate::{
@@ -35,6 +35,29 @@ use std::borrow::{BorrowMut, Cow};
 use uuid::Uuid;
 
 const MAX_NVARCHAR_SIZE: usize = 1 << 30;
+// SQL Server limits large-value types to 2^31 - 1 bytes.
+const MAX_VALUE_SIZE: usize = 0x7fff_ffff;
+
+fn validate_value_length(
+    length: usize,
+    vlc: &VarLenContext,
+    max_type: VarLenType,
+    value_name: &str,
+) -> crate::Result<()> {
+    let limit = if vlc.r#type() == max_type && vlc.len() == 0xffff {
+        MAX_VALUE_SIZE
+    } else {
+        vlc.len()
+    };
+
+    if length > limit {
+        return Err(crate::Error::BulkInput(
+            format!("{value_name} length {length} exceed column limit {limit}").into(),
+        ));
+    }
+
+    Ok(())
+}
 
 #[derive(Clone, Debug, PartialEq)]
 /// A container of a value that can be represented as a TDS value.
@@ -315,18 +338,12 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                         return Err(crate::Error::Encoding("unrepresentable character".into()));
                     }
 
-                    let is_max = vlc.r#type() == VarLenType::BigVarChar && vlc.len() == 0xffff;
-
-                    if !is_max && bytes.len() > vlc.len() {
-                        return Err(crate::Error::BulkInput(
-                            format!(
-                                "Encoded string length {} exceed column limit {}",
-                                bytes.len(),
-                                vlc.len()
-                            )
-                            .into(),
-                        ));
-                    }
+                    validate_value_length(
+                        bytes.len(),
+                        vlc,
+                        VarLenType::BigVarChar,
+                        "Encoded string",
+                    )?;
 
                     if vlc.len() < 0xffff {
                         dst.put_u16_le(bytes.len() as u16);
@@ -334,11 +351,6 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     } else {
                         // unknown size
                         dst.put_u64_le(0xfffffffffffffffe);
-
-                        assert!(
-                            str.len() < 0xffffffff,
-                            "if str longer than this, need to implement multiple blobs"
-                        );
 
                         dst.put_u32_le(bytes.len() as u32);
                         dst.extend_from_slice(bytes.as_slice());
@@ -368,16 +380,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                         let length = dst.len() - len_pos - 2;
 
-                        if length > vlc.len() {
-                            return Err(crate::Error::BulkInput(
-                                format!(
-                                    "Encoded string length {} exceed column limit {}",
-                                    length,
-                                    vlc.len()
-                                )
-                                .into(),
-                            ));
-                        }
+                        validate_value_length(length, vlc, VarLenType::NVarchar, "Encoded string")?;
 
                         let dst: &mut [u8] = dst.borrow_mut();
                         let mut dst = &mut dst[len_pos..];
@@ -385,11 +388,6 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     } else {
                         // unknown size
                         dst.put_u64_le(0xfffffffffffffffe);
-
-                        assert!(
-                            str.len() < 0xffffffff,
-                            "if str longer than this, need to implement multiple blobs"
-                        );
 
                         let len_pos = dst.len();
                         dst.put_u32_le(0u32);
@@ -400,18 +398,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
 
                         let length = dst.len() - len_pos - 4;
 
-                        let is_max = vlc.r#type() == VarLenType::NVarchar && vlc.len() == 0xffff;
-
-                        if !is_max && length > vlc.len() {
-                            return Err(crate::Error::BulkInput(
-                                format!(
-                                    "Encoded string length {} exceed column limit {}",
-                                    length,
-                                    vlc.len()
-                                )
-                                .into(),
-                            ));
-                        }
+                        validate_value_length(length, vlc, VarLenType::NVarchar, "Encoded string")?;
 
                         if length > 0 {
                             // no next blob
@@ -488,18 +475,7 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     || vlc.r#type() == VarLenType::BigVarBin =>
             {
                 if let Some(bytes) = opt {
-                    let is_max = vlc.r#type() == VarLenType::BigVarBin && vlc.len() == 0xffff;
-
-                    if !is_max && bytes.len() > vlc.len() {
-                        return Err(crate::Error::BulkInput(
-                            format!(
-                                "Binary length {} exceed column limit {}",
-                                bytes.len(),
-                                vlc.len()
-                            )
-                            .into(),
-                        ));
-                    }
+                    validate_value_length(bytes.len(), vlc, VarLenType::BigVarBin, "Binary")?;
 
                     if vlc.len() < 0xffff {
                         dst.put_u16_le(bytes.len() as u16);
@@ -712,7 +688,7 @@ mod tests {
     use super::*;
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
     use crate::tds::Collation;
-    use crate::{Error, VarLenContext};
+    use crate::Error;
     use bytes::BytesMut;
 
     async fn test_round_trip(ti: TypeInfo, d: ColumnData<'_>) {
@@ -734,6 +710,17 @@ mod tests {
             .read_u8()
             .await
             .expect_err("decode must consume entire buffer");
+    }
+
+    fn assert_bulk_input(ti: TypeInfo, data: ColumnData<'_>) {
+        let mut buf = BytesMut::new();
+        let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+
+        let err = data
+            .encode(&mut buf_with_ti)
+            .expect_err("invalid value length must fail");
+
+        assert!(matches!(err, Error::BulkInput(_)));
     }
 
     #[tokio::test]
@@ -1036,6 +1023,18 @@ mod tests {
         .await;
     }
 
+    #[test]
+    fn regular_bigvarchar_rejects_value_above_declared_size() {
+        assert_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::BigVarChar,
+                40,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("a".repeat(41).into())),
+        );
+    }
+
     #[tokio::test]
     async fn none_string_with_varlen_bigvarchar() {
         test_round_trip(
@@ -1099,6 +1098,18 @@ mod tests {
             ColumnData::String(Some("hhh".into())),
         )
         .await;
+    }
+
+    #[test]
+    fn regular_nvarchar_rejects_value_above_declared_size() {
+        assert_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                40,
+                Some(Collation::new(13632521, 52)),
+            )),
+            ColumnData::String(Some("a".repeat(21).into())),
+        );
     }
 
     #[tokio::test]
@@ -1290,15 +1301,29 @@ mod tests {
 
     #[test]
     fn regular_bigvarbin_rejects_value_above_declared_size() {
-        let ti = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 40, None));
-        let mut buf = BytesMut::new();
-        let mut buf_with_ti = BytesMutWithTypeInfo::new(&mut buf).with_type_info(&ti);
+        assert_bulk_input(
+            TypeInfo::VarLenSized(VarLenContext::new(VarLenType::BigVarBin, 40, None)),
+            ColumnData::Binary(Some(vec![42; 41].into())),
+        );
+    }
 
-        let err = ColumnData::Binary(Some(vec![42; 41].into()))
-            .encode(&mut buf_with_ti)
-            .expect_err("value above the declared size must fail");
+    #[test]
+    fn max_value_size_limit_is_enforced() {
+        for max_type in [
+            VarLenType::BigVarChar,
+            VarLenType::NVarchar,
+            VarLenType::BigVarBin,
+        ] {
+            let vlc = VarLenContext::new(max_type, 0xffff, None);
 
-        assert!(matches!(err, Error::BulkInput(_)));
+            validate_value_length(0x7fff_ffff, &vlc, max_type, "Value")
+                .expect("value at the SQL Server MAX limit must succeed");
+
+            let err = validate_value_length(0x8000_0000, &vlc, max_type, "Value")
+                .expect_err("value above the SQL Server MAX limit must fail");
+
+            assert!(matches!(err, Error::BulkInput(_)));
+        }
     }
 
     #[tokio::test]
