@@ -945,6 +945,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn decimal_and_numeric_decode_with_max_scale() {
+        for ty in [VarLenType::Decimaln, VarLenType::Numericn] {
+            let type_info = TypeInfo::VarLenSizedPrecision {
+                ty,
+                size: 17,
+                precision: 38,
+                scale: 38,
+            };
+            // Length, positive sign, and sixteen zero magnitude bytes.
+            let mut buf = BytesMut::zeroed(18);
+            buf[0] = 17;
+            buf[1] = 1;
+
+            let decoded = ColumnData::decode(&mut buf.into_sql_read_bytes(), &type_info)
+                .await
+                .expect("scale 38 must decode");
+
+            let ColumnData::Numeric(Some(numeric)) = decoded else {
+                panic!("expected a non-null numeric value");
+            };
+
+            assert_eq!(numeric.value(), 0);
+            assert_eq!(numeric.scale(), 38);
+        }
+    }
+
+    #[tokio::test]
+    async fn numeric_parameter_with_max_scale_round_trips() {
+        let data = ColumnData::Numeric(Some(Numeric::new_with_scale(0, 38)));
+        assert_eq!(data.type_name(), "numeric(38,38)");
+
+        let mut buf = BytesMut::new();
+        data.clone()
+            .encode(&mut BytesMutWithTypeInfo::new(&mut buf))
+            .expect("parameter encode must succeed");
+
+        let reader = &mut buf.into_sql_read_bytes();
+        let type_info = TypeInfo::decode(reader)
+            .await
+            .expect("parameter type must decode");
+        assert_eq!(
+            type_info,
+            TypeInfo::VarLenSizedPrecision {
+                ty: VarLenType::Numericn,
+                size: 17,
+                precision: 38,
+                scale: 38,
+            }
+        );
+
+        let decoded = ColumnData::decode(reader, &type_info)
+            .await
+            .expect("parameter value must decode");
+        assert_eq!(decoded, data);
+    }
+
+    #[tokio::test]
     async fn none_numeric_with_varlen_sized_precision() {
         test_round_trip(
             TypeInfo::VarLenSizedPrecision {
