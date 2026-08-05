@@ -29,11 +29,10 @@ impl Numeric {
     /// Creates a new Numeric value.
     ///
     /// # Panic
-    /// It will panic if the scale exceed 37.
+    /// It will panic if the scale exceeds 38.
     pub fn new_with_scale(value: i128, scale: u8) -> Self {
-        // scale cannot exceed 37 since a
-        // max precision of 38 is possible here.
-        assert!(scale < 38);
+        // SQL Server supports a maximum precision and scale of 38.
+        assert!(scale <= 38);
 
         Numeric { value, scale }
     }
@@ -79,7 +78,7 @@ impl Numeric {
         }
 
         if result == 0 {
-            1 + self.scale()
+            (1 + self.scale()).min(38)
         } else {
             result + self.scale()
         }
@@ -237,10 +236,16 @@ impl PartialEq for Numeric {
     fn eq(&self, other: &Self) -> bool {
         match self.scale.cmp(&other.scale) {
             Ordering::Greater => {
-                10i128.pow((self.scale - other.scale) as u32) * other.value == self.value
+                10i128
+                    .checked_pow((self.scale - other.scale) as u32)
+                    .and_then(|factor| other.value.checked_mul(factor))
+                    == Some(self.value)
             }
             Ordering::Less => {
-                10i128.pow((other.scale - self.scale) as u32) * self.value == other.value
+                10i128
+                    .checked_pow((other.scale - self.scale) as u32)
+                    .and_then(|factor| self.value.checked_mul(factor))
+                    == Some(other.value)
             }
             Ordering::Equal => self.value == other.value,
         }
@@ -367,6 +372,21 @@ mod tests {
                 scale: 1
             }
         );
+    }
+
+    #[test]
+    fn numeric_eq_with_max_scale_is_overflow_safe() {
+        let scale_38_zero = Numeric::new_with_scale(0, 38);
+        let two = Numeric::new_with_scale(2, 0);
+
+        assert_ne!(scale_38_zero, two);
+        assert_ne!(two, scale_38_zero);
+
+        let scale_38_tenth = Numeric::new_with_scale(10i128.pow(37), 38);
+        let tenth = Numeric::new_with_scale(1, 1);
+
+        assert_eq!(scale_38_tenth, tenth);
+        assert_eq!(tenth, scale_38_tenth);
     }
 
     #[test]

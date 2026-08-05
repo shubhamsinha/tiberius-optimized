@@ -1801,6 +1801,25 @@ where
     Ok(())
 }
 
+#[test_on_runtimes]
+async fn numeric_type_max_scale_presentation<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let num = Numeric::new_with_scale(0, 38);
+
+    let row = conn
+        .query("SELECT @P1", &[&num])
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    assert_eq!(Some(num), row.get(0));
+
+    Ok(())
+}
+
 #[cfg(feature = "rust_decimal")]
 #[cfg(test)]
 mod rust_decimal {
