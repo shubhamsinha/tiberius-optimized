@@ -640,6 +640,14 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u64_le(0xffffffffffffffff_u64);
                 }
             }
+            (ColumnData::Xml(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::NVarchar && vlc.len() == 0xffff =>
+            {
+                ColumnData::String(
+                    opt.map(|xml| Cow::Owned(xml.into_owned().into_nvarchar_string())),
+                )
+                .encode(dst)?;
+            }
             (ColumnData::Xml(Some(xml)), None) => {
                 dst.put_u8(VarLenType::Xml as u8);
                 dst.put_u8(0);
@@ -1570,6 +1578,25 @@ mod tests {
             ColumnData::Xml(None),
         )
         .await;
+    }
+
+    #[test]
+    fn ordinary_xml_parameter_encoding_is_unchanged() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+        let mut buf = BytesMut::new();
+
+        ColumnData::Xml(Some(Cow::Owned(XmlData::new(xml))))
+            .encode(&mut BytesMutWithTypeInfo::new(&mut buf))
+            .expect("encode must succeed");
+
+        assert_eq!(&[VarLenType::Xml as u8, 0], &buf[..2]);
+        let encoded_declaration: Vec<u8> = xml
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        assert!(buf
+            .windows(encoded_declaration.len())
+            .any(|window| window == encoded_declaration));
     }
 
     #[tokio::test]

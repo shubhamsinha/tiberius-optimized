@@ -5,8 +5,11 @@ use std::{
 
 use crate::{
     error::Error,
-    tds::codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
-    Column, ColumnData, ColumnType, SqlReadBytes,
+    tds::{
+        codec::{Encode, FixedLenType, TokenType, TypeInfo, VarLenType},
+        Collation,
+    },
+    Column, ColumnData, ColumnType, SqlReadBytes, VarLenContext,
 };
 use asynchronous_codec::BytesMut;
 use bytes::BufMut;
@@ -21,6 +24,20 @@ pub struct TokenColMetaData<'a> {
 pub struct MetaDataColumn<'a> {
     pub base: BaseMetaDataColumn,
     pub col_name: Cow<'a, str>,
+}
+
+impl<'a> MetaDataColumn<'a> {
+    pub(crate) fn into_bulk_load(mut self) -> Self {
+        if matches!(self.base.ty, TypeInfo::Xml { .. }) {
+            self.base.ty = TypeInfo::VarLenSized(VarLenContext::new(
+                VarLenType::NVarchar,
+                0xffff,
+                Some(Collation::new(0, 0)),
+            ));
+        }
+
+        self
+    }
 }
 
 impl<'a> Display for MetaDataColumn<'a> {
@@ -345,5 +362,48 @@ impl BaseMetaDataColumn {
         };
 
         Ok(BaseMetaDataColumn { flags, ty })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn xml_column() -> MetaDataColumn<'static> {
+        MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::empty(),
+                ty: TypeInfo::Xml {
+                    schema: None,
+                    size: 0xfffffffffffffffe_usize,
+                },
+            },
+            col_name: Cow::Borrowed("x"),
+        }
+    }
+
+    #[test]
+    fn bulk_xml_uses_nvarchar_max_declaration_and_metadata() {
+        let column = xml_column().into_bulk_load();
+        assert_eq!("x nvarchar(max)", column.to_string());
+
+        let mut buf = BytesMut::new();
+        TokenColMetaData {
+            columns: vec![column],
+        }
+        .encode(&mut buf)
+        .expect("encode must succeed");
+
+        assert_eq!(
+            &[
+                0x81, 0x01, 0x00, // COLMETADATA and column count
+                0x00, 0x00, 0x00, 0x00, // user type
+                0x00, 0x00, // flags
+                0xe7, 0xff, 0xff, // NVARCHAR(MAX)
+                0x00, 0x00, 0x00, 0x00, 0x00, // raw collation
+                0x01, 0x78, 0x00, // column name: x
+            ],
+            buf.as_ref()
+        );
     }
 }
