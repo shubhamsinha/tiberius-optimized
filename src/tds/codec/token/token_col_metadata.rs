@@ -27,6 +27,16 @@ impl<'a> Display for MetaDataColumn<'a> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ", self.col_name)?;
 
+        self.fmt_type(f)
+    }
+}
+
+impl<'a> MetaDataColumn<'a> {
+    pub(crate) fn bulk_insert_sql(&self) -> impl Display + '_ {
+        BulkInsertColumn(self)
+    }
+
+    fn fmt_type(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match &self.base.ty {
             TypeInfo::FixedLen(fixed) => match fixed {
                 FixedLenType::Int1 => write!(f, "tinyint")?,
@@ -109,6 +119,15 @@ impl<'a> Display for MetaDataColumn<'a> {
         }
 
         Ok(())
+    }
+}
+
+struct BulkInsertColumn<'a, 'b>(&'a MetaDataColumn<'b>);
+
+impl Display for BulkInsertColumn<'_, '_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "[{}] ", self.0.col_name.replace(']', "]]"))?;
+        self.0.fmt_type(f)
     }
 }
 
@@ -345,5 +364,39 @@ impl BaseMetaDataColumn {
         };
 
         Ok(BaseMetaDataColumn { flags, ty })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn int_column(name: &'static str) -> MetaDataColumn<'static> {
+        MetaDataColumn {
+            base: BaseMetaDataColumn {
+                flags: BitFlags::empty(),
+                ty: TypeInfo::FixedLen(FixedLenType::Int4),
+            },
+            col_name: Cow::Borrowed(name),
+        }
+    }
+
+    #[test]
+    fn bulk_insert_column_sql_quotes_identifiers() {
+        for (name, expected) in [
+            ("content", "[content] int"),
+            ("order", "[order] int"),
+            ("customer name", "[customer name] int"),
+            ("a]b", "[a]]b] int"),
+            ("顧客名", "[顧客名] int"),
+        ] {
+            let column = int_column(name);
+            assert_eq!(expected, column.bulk_insert_sql().to_string());
+        }
+    }
+
+    #[test]
+    fn metadata_column_display_remains_unquoted() {
+        assert_eq!("content int", int_column("content").to_string());
     }
 }

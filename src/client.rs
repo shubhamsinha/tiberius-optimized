@@ -333,7 +333,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .collect();
 
         self.connection.flush_stream().await?;
-        let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");
+        let col_data = columns
+            .iter()
+            .map(|column| column.bulk_insert_sql().to_string())
+            .join(", ");
         let query = format!("INSERT BULK {} ({})", table, col_data);
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
