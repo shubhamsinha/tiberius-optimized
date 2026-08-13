@@ -4,12 +4,10 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
-use tiberius::{IntoSql, Result, TokenRow};
+use tiberius::{error::Error, xml::XmlData, IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
-use chrono::DateTime;
-#[cfg(all(feature = "tds73", feature = "chrono"))]
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
 use runtimes_macro::test_on_runtimes;
 
@@ -141,6 +139,92 @@ test_bulk_type!(float(
     1000,
     vec![std::f64::consts::PI; 1000].into_iter()
 ));
+
+#[cfg(all(feature = "tds73", feature = "chrono"))]
+#[test_on_runtimes]
+async fn bulk_load_date_round_trip<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY, content DATE NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let minimum = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+    let maximum = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap();
+    let values = [
+        Some(minimum),
+        Some(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+        Some(maximum),
+        None,
+    ];
+    let mut request = conn.bulk_insert(&table).await?;
+
+    for value in values {
+        let mut row = TokenRow::new();
+        row.push(value.into_sql());
+        request.send(row).await?;
+    }
+
+    assert_eq!(4, request.finalize().await?.total());
+
+    let rows = conn
+        .query(&format!("SELECT content FROM {} ORDER BY id", table), &[])
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(Some(minimum), rows[0].get(0));
+    assert_eq!(
+        Some(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+        rows[1].get(0)
+    );
+    assert_eq!(Some(maximum), rows[2].get(0));
+    assert_eq!(None, rows[3].get::<NaiveDate, _>(0));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_load_xml_reports_unsupported_type<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    // MS-TDS 2.2.6.1 rejects XMLTYPE metadata in INSERT BULK.
+    let table = format!("##{}", random_table().await);
+    conn.execute(&format!("CREATE TABLE {} (content XML NULL)", table), &[])
+        .await?;
+
+    let xml = XmlData::new("<root>雪</root>");
+    let mut request = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    row.push((&xml).into_sql());
+    request.send(row).await?;
+
+    let error = request
+        .finalize()
+        .await
+        .expect_err("SQL Server must reject XMLTYPE metadata in INSERT BULK");
+
+    match error {
+        Error::Server(error) => {
+            assert_eq!(4816, error.code());
+            assert_eq!(
+                "Invalid column type from bcp client for colid 1.",
+                error.message()
+            );
+        }
+        error => panic!("expected server error 4816, got {error:?}"),
+    }
+
+    Ok(())
+}
 
 test_bulk_type!(varchar_limited(
     "VARCHAR(255)",

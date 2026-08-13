@@ -1440,6 +1440,30 @@ mod tests {
     }
 
     #[cfg(feature = "tds73")]
+    #[test]
+    fn date_values_match_tds() {
+        let type_info = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None));
+
+        for (date, expected) in [
+            (
+                ColumnData::Date(Some(Date::new(0))),
+                &[0x03, 0x00, 0x00, 0x00][..],
+            ),
+            (
+                ColumnData::Date(Some(Date::new(3_652_058))),
+                &[0x03, 0xda, 0xb9, 0x37][..],
+            ),
+            (ColumnData::Date(None), &[0x00][..]),
+        ] {
+            let mut buf = BytesMut::new();
+            date.encode(&mut BytesMutWithTypeInfo::new(&mut buf).with_type_info(&type_info))
+                .expect("encode must succeed");
+
+            assert_eq!(expected, buf.as_ref());
+        }
+    }
+
+    #[cfg(feature = "tds73")]
     #[tokio::test]
     async fn date_with_varlen_daten() {
         test_round_trip(
