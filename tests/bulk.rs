@@ -4,7 +4,7 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
-use tiberius::{IntoSql, Result, TokenRow};
+use tiberius::{BulkLoadOptions, IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
 use chrono::DateTime;
@@ -141,6 +141,119 @@ test_bulk_type!(float(
     1000,
     vec![std::f64::consts::PI; 1000].into_iter()
 ));
+
+#[test_on_runtimes]
+async fn bulk_load_quoted_identifiers<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (\
+                [normal] INT NOT NULL, \
+                [order] INT NOT NULL, \
+                [customer name] INT NOT NULL, \
+                [a]]b] INT NOT NULL, \
+                [顧客名] INT NOT NULL\
+            )",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let mut req = conn.bulk_insert(&table).await?;
+    let mut row = TokenRow::new();
+    for value in 1i32..=5 {
+        row.push(value.into_sql());
+    }
+    req.send(row).await?;
+
+    let result = req.finalize().await?;
+    assert_eq!(1, result.total());
+
+    let row = conn
+        .query(
+            &format!(
+                "SELECT [normal], [order], [customer name], [a]]b], [顧客名] FROM {}",
+                table
+            ),
+            &[],
+        )
+        .await?
+        .into_row()
+        .await?
+        .unwrap();
+
+    assert_eq!(Some(1), row.get::<i32, _>("normal"));
+    assert_eq!(Some(2), row.get::<i32, _>("order"));
+    assert_eq!(Some(3), row.get::<i32, _>("customer name"));
+    assert_eq!(Some(4), row.get::<i32, _>("a]b"));
+    assert_eq!(Some(5), row.get::<i32, _>("顧客名"));
+
+    Ok(())
+}
+
+async fn assert_bulk_insert_options<S>(
+    conn: &mut tiberius::Client<S>,
+    options: Option<BulkLoadOptions>,
+) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+    conn.execute(
+        &format!("CREATE TABLE {} (content INT NOT NULL)", table),
+        &[],
+    )
+    .await?;
+
+    let mut request = match options {
+        Some(options) => conn.bulk_insert_with_options(&table, options).await?,
+        None => conn.bulk_insert(&table).await?,
+    };
+
+    for value in [3i32, 1, 2] {
+        let mut row = TokenRow::new();
+        row.push(value.into_sql());
+        request.send(row).await?;
+    }
+
+    assert_eq!(3, request.finalize().await?.total());
+
+    let rows = conn
+        .query(
+            &format!("SELECT content FROM {} ORDER BY content", table),
+            &[],
+        )
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(Some(1), rows[0].get::<i32, _>(0));
+    assert_eq!(Some(2), rows[1].get::<i32, _>(0));
+    assert_eq!(Some(3), rows[2].get::<i32, _>(0));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_load_default_options<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    assert_bulk_insert_options(&mut conn, None).await
+}
+
+#[test_on_runtimes]
+async fn bulk_load_tablock<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    assert_bulk_insert_options(&mut conn, Some(BulkLoadOptions::new().with_tablock())).await
+}
 
 test_bulk_type!(varchar_limited(
     "VARCHAR(255)",
