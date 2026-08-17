@@ -640,6 +640,14 @@ impl<'a> Encode<BytesMutWithTypeInfo<'a>> for ColumnData<'a> {
                     dst.put_u64_le(0xffffffffffffffff_u64);
                 }
             }
+            (ColumnData::Xml(opt), Some(TypeInfo::VarLenSized(vlc)))
+                if vlc.r#type() == VarLenType::NVarchar && vlc.len() == 0xffff =>
+            {
+                ColumnData::String(
+                    opt.map(|xml| Cow::Owned(xml.into_owned().into_nvarchar_string())),
+                )
+                .encode(dst)?;
+            }
             (ColumnData::Xml(Some(xml)), None) => {
                 dst.put_u8(VarLenType::Xml as u8);
                 dst.put_u8(0);
@@ -1440,6 +1448,30 @@ mod tests {
     }
 
     #[cfg(feature = "tds73")]
+    #[test]
+    fn date_values_match_tds() {
+        let type_info = TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None));
+
+        for (date, expected) in [
+            (
+                ColumnData::Date(Some(Date::new(0))),
+                &[0x03, 0x00, 0x00, 0x00][..],
+            ),
+            (
+                ColumnData::Date(Some(Date::new(3_652_058))),
+                &[0x03, 0xda, 0xb9, 0x37][..],
+            ),
+            (ColumnData::Date(None), &[0x00][..]),
+        ] {
+            let mut buf = BytesMut::new();
+            date.encode(&mut BytesMutWithTypeInfo::new(&mut buf).with_type_info(&type_info))
+                .expect("encode must succeed");
+
+            assert_eq!(expected, buf.as_ref());
+        }
+    }
+
+    #[cfg(feature = "tds73")]
     #[tokio::test]
     async fn date_with_varlen_daten() {
         test_round_trip(
@@ -1546,6 +1578,25 @@ mod tests {
             ColumnData::Xml(None),
         )
         .await;
+    }
+
+    #[test]
+    fn ordinary_xml_parameter_encoding_is_unchanged() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?><root/>"#;
+        let mut buf = BytesMut::new();
+
+        ColumnData::Xml(Some(Cow::Owned(XmlData::new(xml))))
+            .encode(&mut BytesMutWithTypeInfo::new(&mut buf))
+            .expect("encode must succeed");
+
+        assert_eq!(&[VarLenType::Xml as u8, 0], &buf[..2]);
+        let encoded_declaration: Vec<u8> = xml
+            .encode_utf16()
+            .flat_map(|unit| unit.to_le_bytes())
+            .collect();
+        assert!(buf
+            .windows(encoded_declaration.len())
+            .any(|window| window == encoded_declaration));
     }
 
     #[tokio::test]

@@ -4,12 +4,10 @@ use once_cell::sync::Lazy;
 use std::cell::RefCell;
 use std::env;
 use std::sync::Once;
-use tiberius::{BulkLoadOptions, IntoSql, Result, TokenRow};
+use tiberius::{xml::XmlData, BulkLoadOptions, IntoSql, Result, TokenRow};
 
 #[cfg(all(feature = "tds73", feature = "chrono"))]
-use chrono::DateTime;
-#[cfg(all(feature = "tds73", feature = "chrono"))]
-use chrono::NaiveDateTime;
+use chrono::{DateTime, NaiveDate, NaiveDateTime};
 
 use runtimes_macro::test_on_runtimes;
 
@@ -192,6 +190,119 @@ where
     assert_eq!(Some(3), row.get::<i32, _>("customer name"));
     assert_eq!(Some(4), row.get::<i32, _>("a]b"));
     assert_eq!(Some(5), row.get::<i32, _>("顧客名"));
+
+    Ok(())
+}
+
+#[cfg(all(feature = "tds73", feature = "chrono"))]
+#[test_on_runtimes]
+async fn bulk_load_date_round_trip<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY, content DATE NULL)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let minimum = NaiveDate::from_ymd_opt(1, 1, 1).unwrap();
+    let maximum = NaiveDate::from_ymd_opt(9999, 12, 31).unwrap();
+    let values = [
+        Some(minimum),
+        Some(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+        Some(maximum),
+        None,
+    ];
+    let mut request = conn.bulk_insert(&table).await?;
+
+    for value in values {
+        let mut row = TokenRow::new();
+        row.push(value.into_sql());
+        request.send(row).await?;
+    }
+
+    assert_eq!(4, request.finalize().await?.total());
+
+    let rows = conn
+        .query(&format!("SELECT content FROM {} ORDER BY id", table), &[])
+        .await?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(Some(minimum), rows[0].get(0));
+    assert_eq!(
+        Some(NaiveDate::from_ymd_opt(2024, 2, 29).unwrap()),
+        rows[1].get(0)
+    );
+    assert_eq!(Some(maximum), rows[2].get(0));
+    assert_eq!(None, rows[3].get::<NaiveDate, _>(0));
+
+    Ok(())
+}
+
+#[test_on_runtimes]
+async fn bulk_load_xml_round_trip<S>(mut conn: tiberius::Client<S>) -> Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin + Send,
+{
+    let table = format!("##{}", random_table().await);
+    conn.execute(
+        &format!(
+            "CREATE TABLE {} (id INT IDENTITY, before_value INT, content XML NULL, after_value INT)",
+            table
+        ),
+        &[],
+    )
+    .await?;
+
+    let unicode = XmlData::new("<root>雪😀</root>");
+    let declaration = XmlData::new(r#"<?xml version="1.0" encoding="UTF-8"?><root>é雪</root>"#);
+    let values = [
+        (1, Some(&unicode), 11),
+        (2, None, 12),
+        (3, Some(&declaration), 13),
+    ];
+    let mut request = conn.bulk_insert(&table).await?;
+
+    for (before, xml, after) in values {
+        let mut row = TokenRow::new();
+        row.push(before.into_sql());
+        row.push(xml.into_sql());
+        row.push(after.into_sql());
+        request.send(row).await?;
+    }
+
+    assert_eq!(3, request.finalize().await?.total());
+
+    let rows = conn
+        .query(
+            &format!(
+                "SELECT before_value, CONVERT(NVARCHAR(MAX), content), after_value FROM {} ORDER BY id",
+                table
+            ),
+            &[],
+        )
+        .await
+        ?
+        .into_first_result()
+        .await?;
+
+    assert_eq!(Some(1), rows[0].get::<i32, _>(0));
+    assert_eq!(Some(unicode.as_ref()), rows[0].get::<&str, _>(1));
+    assert_eq!(Some(11), rows[0].get::<i32, _>(2));
+
+    assert_eq!(Some(2), rows[1].get::<i32, _>(0));
+    assert_eq!(None, rows[1].get::<&str, _>(1));
+    assert_eq!(Some(12), rows[1].get::<i32, _>(2));
+
+    assert_eq!(Some(3), rows[2].get::<i32, _>(0));
+    assert_eq!(Some("<root>é雪</root>"), rows[2].get::<&str, _>(1));
+    assert_eq!(Some(13), rows[2].get::<i32, _>(2));
 
     Ok(())
 }

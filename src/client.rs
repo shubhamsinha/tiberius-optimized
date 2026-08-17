@@ -366,6 +366,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             })?
             .into_iter()
             .filter(|column| column.base.flags.contains(ColumnFlag::Updateable))
+            .map(|column| column.into_bulk_load())
             .collect();
 
         self.connection.flush_stream().await?;

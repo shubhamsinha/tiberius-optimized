@@ -188,7 +188,10 @@ impl RowBitmap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{BaseMetaDataColumn, ColumnFlag, FixedLenType, MetaDataColumn, TypeInfo};
+    use crate::{
+        tds::Collation, xml::XmlData, BaseMetaDataColumn, ColumnFlag, FixedLenType, IntoSql,
+        MetaDataColumn, TypeInfo, VarLenContext, VarLenType,
+    };
     use bytes::BytesMut;
 
     #[tokio::test]
@@ -206,5 +209,64 @@ mod tests {
 
         row.encode(&mut buf_with_columns)
             .expect_err("wrong number of columns");
+    }
+
+    fn bulk_xml_columns() -> Vec<MetaDataColumn<'static>> {
+        vec![
+            MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    flags: Default::default(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                },
+                col_name: Default::default(),
+            },
+            MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    flags: ColumnFlag::Nullable.into(),
+                    ty: TypeInfo::VarLenSized(VarLenContext::new(
+                        VarLenType::NVarchar,
+                        0xffff,
+                        Some(Collation::new(0, 0)),
+                    )),
+                },
+                col_name: Default::default(),
+            },
+            MetaDataColumn {
+                base: BaseMetaDataColumn {
+                    flags: Default::default(),
+                    ty: TypeInfo::FixedLen(FixedLenType::Int4),
+                },
+                col_name: Default::default(),
+            },
+        ]
+    }
+
+    fn encode_bulk_xml_row(xml: XmlData) -> BytesMut {
+        let columns = bulk_xml_columns();
+        let mut row = TokenRow::new();
+        row.push(1i32.into_sql());
+        row.push(xml.into_sql());
+        row.push(2i32.into_sql());
+        let mut buf = BytesMut::new();
+
+        row.encode(&mut BytesMutWithDataColumns::new(&mut buf, &columns))
+            .expect("encode must succeed");
+
+        buf
+    }
+
+    #[test]
+    fn bulk_xml_does_not_consume_following_column() {
+        assert_eq!(
+            &[
+                0xd1, 0x01, 0x00, 0x00, 0x00, // ROW and first INT
+                0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, // PLP unknown length
+                0x08, 0x00, 0x00, 0x00, // chunk length
+                0x3c, 0x00, 0xea, 0x96, 0x2f, 0x00, 0x3e, 0x00, // UTF-16LE XML
+                0x00, 0x00, 0x00, 0x00, // PLP terminator
+                0x02, 0x00, 0x00, 0x00, // following INT
+            ],
+            encode_bulk_xml_row(XmlData::new("<雪/>")).as_ref()
+        );
     }
 }

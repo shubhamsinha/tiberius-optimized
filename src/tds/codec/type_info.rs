@@ -71,10 +71,11 @@ impl Encode<BytesMut> for VarLenContext {
         // length
         match self.r#type {
             #[cfg(feature = "tds73")]
-            VarLenType::Daten
-            | VarLenType::Timen
-            | VarLenType::DatetimeOffsetn
-            | VarLenType::Datetime2 => {
+            VarLenType::Daten => {
+                // DATE TYPE_INFO has no length byte.
+            }
+            #[cfg(feature = "tds73")]
+            VarLenType::Timen | VarLenType::DatetimeOffsetn | VarLenType::Datetime2 => {
                 dst.put_u8(self.len() as u8);
             }
             VarLenType::Bitn
@@ -360,6 +361,48 @@ impl TypeInfo {
 mod tests {
     use super::*;
     use crate::sql_read_bytes::test_utils::IntoSqlReadBytes;
+
+    #[cfg(feature = "tds73")]
+    #[test]
+    fn temporal_type_info_matches_tds() {
+        for (type_info, expected) in [
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Daten, 3, None)),
+                &[0x28][..],
+            ),
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Timen, 7, None)),
+                &[0x29, 0x07][..],
+            ),
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::Datetime2, 7, None)),
+                &[0x2a, 0x07][..],
+            ),
+            (
+                TypeInfo::VarLenSized(VarLenContext::new(VarLenType::DatetimeOffsetn, 7, None)),
+                &[0x2b, 0x07][..],
+            ),
+        ] {
+            let mut buf = BytesMut::new();
+            type_info.encode(&mut buf).expect("encode must succeed");
+
+            assert_eq!(expected, buf.as_ref());
+        }
+    }
+
+    #[test]
+    fn untyped_xml_type_info_matches_tds() {
+        let mut buf = BytesMut::new();
+
+        TypeInfo::Xml {
+            schema: None,
+            size: 0xfffffffffffffffe_usize,
+        }
+        .encode(&mut buf)
+        .expect("encode must succeed");
+
+        assert_eq!(&[0xf1, 0x00], buf.as_ref());
+    }
 
     #[tokio::test]
     async fn round_trip() {
