@@ -29,6 +29,29 @@ use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::stream::TryStreamExt;
 use std::{borrow::Cow, fmt::Debug};
 
+/// Options for a bulk insert operation.
+///
+/// By default, bulk inserts use SQL Server's normal locking behavior. Enabling
+/// `TABLOCK` requests a table-level lock, which changes concurrency and may
+/// improve bulk performance.
+#[derive(Debug, Default)]
+pub struct BulkLoadOptions {
+    table_lock: bool,
+}
+
+impl BulkLoadOptions {
+    /// Creates options with `TABLOCK` disabled.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Enables the SQL Server `TABLOCK` bulk option.
+    pub fn with_tablock(mut self) -> Self {
+        self.table_lock = true;
+        self
+    }
+}
+
 /// `Client` is the main entry point to the SQL Server, providing query
 /// execution capabilities.
 ///
@@ -300,6 +323,19 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         &'a mut self,
         table: &'a str,
     ) -> crate::Result<BulkLoadRequest<'a, S>> {
+        self.bulk_insert_with_options(table, BulkLoadOptions::default())
+            .await
+    }
+
+    /// Starts a bulk insert with the given [`BulkLoadOptions`].
+    ///
+    /// Enabling `TABLOCK` requests a table-level lock for the operation. This
+    /// changes locking behavior and may improve bulk performance.
+    pub async fn bulk_insert_with_options<'a>(
+        &'a mut self,
+        table: &'a str,
+        options: BulkLoadOptions,
+    ) -> crate::Result<BulkLoadRequest<'a, S>> {
         // Start the bulk request
         self.connection.flush_stream().await?;
 
@@ -334,8 +370,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
             .collect();
 
         self.connection.flush_stream().await?;
-        let col_data = columns.iter().map(|c| format!("{}", c)).join(", ");
-        let query = format!("INSERT BULK {} ({})", table, col_data);
+        let col_data = columns
+            .iter()
+            .map(|column| column.bulk_insert_sql().to_string())
+            .join(", ");
+        let query = bulk_insert_statement(table, &col_data, options);
 
         let req = BatchRequest::new(query, self.connection.context().transaction_descriptor());
         let id = self.connection.context_mut().next_packet_id();
@@ -407,5 +446,40 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Client<S> {
         self.connection.send(PacketHeader::rpc(id), req).await?;
 
         Ok(())
+    }
+}
+
+fn bulk_insert_statement(table: &str, columns: &str, options: BulkLoadOptions) -> String {
+    let mut query = format!("INSERT BULK {} ({})", table, columns);
+
+    if options.table_lock {
+        query.push_str(" WITH (TABLOCK)");
+    }
+
+    query
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_bulk_insert_statement_is_unchanged() {
+        assert_eq!(
+            "INSERT BULK dbo.target ([content] int)",
+            bulk_insert_statement("dbo.target", "[content] int", BulkLoadOptions::default())
+        );
+    }
+
+    #[test]
+    fn bulk_insert_statement_supports_tablock() {
+        assert_eq!(
+            "INSERT BULK dbo.target ([content] int) WITH (TABLOCK)",
+            bulk_insert_statement(
+                "dbo.target",
+                "[content] int",
+                BulkLoadOptions::new().with_tablock()
+            )
+        );
     }
 }
