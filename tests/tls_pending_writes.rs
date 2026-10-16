@@ -20,10 +20,11 @@ static CONN_STR: Lazy<String> = Lazy::new(|| {
     })
 });
 
-/// A socket that is briefly not writable before every write.
+/// A socket that returns `Pending` once before each write and each flush.
 struct PendingWrites<S> {
     inner: S,
-    pend: bool,
+    pend_write: bool,
+    pend_flush: bool,
 }
 
 impl<S: AsyncRead + Unpin> AsyncRead for PendingWrites<S> {
@@ -42,16 +43,22 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for PendingWrites<S> {
         cx: &mut Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        if self.pend {
-            self.pend = false;
+        if self.pend_write {
+            self.pend_write = false;
             cx.waker().wake_by_ref();
             return Poll::Pending;
         }
-        self.pend = true;
+        self.pend_write = true;
         Pin::new(&mut self.inner).poll_write(cx, buf)
     }
 
     fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        if self.pend_flush {
+            self.pend_flush = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        self.pend_flush = true;
         Pin::new(&mut self.inner).poll_flush(cx)
     }
 
@@ -68,7 +75,8 @@ async fn tls_handshake_survives_pending_writes() -> Result<()> {
     tcp.set_nodelay(true)?;
     let stream = PendingWrites {
         inner: tcp.compat_write(),
-        pend: true,
+        pend_write: true,
+        pend_flush: true,
     };
 
     let mut client = Client::connect(config, stream).await?;

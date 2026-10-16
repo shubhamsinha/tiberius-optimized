@@ -457,7 +457,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> Connection<S> {
                 _ => unreachable!(),
             };
 
-            stream.get_mut().handshake_complete();
+            stream.get_mut().handshake_complete().await?;
             event!(Level::INFO, "TLS handshake successful");
 
             let transport = Framed::new(MaybeTlsStream::Tls(stream), PacketCodec);

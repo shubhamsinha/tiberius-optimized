@@ -12,7 +12,7 @@ use bytes::BytesMut;
 use futures_util::io::{AsyncRead, AsyncWrite};
 use futures_util::ready;
 use std::{
-    cmp, io, mem,
+    cmp, io,
     pin::Pin,
     task::{self, Poll},
 };
@@ -43,11 +43,7 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> MaybeTlsStream<S> {
                 feature = "native-tls",
                 feature = "vendored-openssl"
             ))]
-            Self::Tls(mut tls) => {
-                let wrapper = tls.get_mut();
-                debug_assert!(wrapper.out_buf.is_empty());
-                wrapper.stream.take().unwrap()
-            }
+            Self::Tls(mut tls) => tls.get_mut().stream.take().unwrap(),
         }
     }
 }
@@ -118,9 +114,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for MaybeTlsStream<S> 
 ///
 /// What it does is it interferes on handshake for TDS packet handling,
 /// and when complete, just passes the calls to the underlying connection.
-///
-/// The underlying stream's `poll_flush` must not return `Pending` during the
-/// handshake.
 pub(crate) struct TlsPreloginWrapper<S> {
     stream: Option<S>,
     pending_handshake: bool,
@@ -130,8 +123,8 @@ pub(crate) struct TlsPreloginWrapper<S> {
     read_remaining: usize,
 
     wr_buf: Vec<u8>,
-    out_buf: Vec<u8>,
-    out_pos: usize,
+    wr_pos: usize,
+    header_written: bool,
 }
 
 #[cfg(any(
@@ -149,31 +142,46 @@ impl<S> TlsPreloginWrapper<S> {
             header_pos: 0,
             read_remaining: 0,
             wr_buf: vec![0u8; HEADER_BYTES],
-            out_buf: Vec::new(),
-            out_pos: 0,
+            wr_pos: 0,
+            header_written: false,
         }
     }
 
-    pub fn handshake_complete(&mut self) {
+    pub async fn handshake_complete(&mut self) -> io::Result<()>
+    where
+        S: AsyncWrite + Unpin,
+    {
+        // The backend can finish the handshake with its last packet still queued.
+        std::future::poll_fn(|cx| self.poll_send_queued(cx)).await?;
         self.pending_handshake = false;
+
+        Ok(())
     }
 }
 
 impl<S: AsyncWrite + Unpin> TlsPreloginWrapper<S> {
     fn poll_send_queued(&mut self, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
-        while self.out_pos < self.out_buf.len() {
-            let written = ready!(Pin::new(self.stream.as_mut().unwrap())
-                .poll_write(cx, &self.out_buf[self.out_pos..]))?;
+        if !self.header_written {
+            return Poll::Ready(Ok(()));
+        }
+
+        while self.wr_pos < self.wr_buf.len() {
+            let written =
+                ready!(Pin::new(self.stream.as_mut().unwrap())
+                    .poll_write(cx, &self.wr_buf[self.wr_pos..]))?;
 
             if written == 0 {
                 return Poll::Ready(Err(io::ErrorKind::WriteZero.into()));
             }
 
-            self.out_pos += written;
+            self.wr_pos += written;
         }
 
-        self.out_buf.clear();
-        self.out_pos = 0;
+        ready!(Pin::new(self.stream.as_mut().unwrap()).poll_flush(cx))?;
+
+        self.wr_buf.truncate(HEADER_BYTES);
+        self.wr_pos = 0;
+        self.header_written = false;
 
         Poll::Ready(Ok(()))
     }
@@ -185,8 +193,6 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
         cx: &mut task::Context<'_>,
         buf: &mut [u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(self.poll_send_queued(cx))?;
-
         // Normal operation does not need any extra treatment, we handle packets
         // in the codec.
         if !self.pending_handshake {
@@ -194,6 +200,8 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncRead for TlsPreloginWrapper<
         }
 
         let inner = self.get_mut();
+
+        ready!(inner.poll_send_queued(cx))?;
 
         // Read the headers separately and do not send them to the Tls
         // connection handling.
@@ -249,13 +257,13 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
         cx: &mut task::Context<'_>,
         buf: &[u8],
     ) -> Poll<io::Result<usize>> {
-        ready!(self.poll_send_queued(cx))?;
-
         // Normal operation does not need any extra treatment, we handle
         // packets in the codec.
         if !self.pending_handshake {
             return Pin::new(&mut self.stream.as_mut().unwrap()).poll_write(cx, buf);
         }
+
+        ready!(self.poll_send_queued(cx))?;
 
         // Buffering data.
         self.wr_buf.extend_from_slice(buf);
@@ -267,14 +275,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
         let inner = self.get_mut();
 
         if !inner.pending_handshake {
-            ready!(inner.poll_send_queued(cx))?;
             return Pin::new(&mut inner.stream.as_mut().unwrap()).poll_flush(cx);
         }
 
         // If on handshake mode, wraps the data to a TDS packet before sending.
-        if inner.wr_buf.len() > HEADER_BYTES {
-            debug_assert!(inner.out_buf.is_empty());
-
+        if !inner.header_written && inner.wr_buf.len() > HEADER_BYTES {
             let mut header = PacketHeader::new(inner.wr_buf.len(), 0);
 
             header.set_type(PacketType::PreLogin);
@@ -292,29 +297,27 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
                 inner.wr_buf.len(),
             );
 
-            inner.out_buf = mem::replace(&mut inner.wr_buf, vec![0u8; HEADER_BYTES]);
+            inner.header_written = true;
         }
 
-        // rust-openssl cannot retry a pending flush, so the packet stays
-        // queued and goes out before the next read or write.
+        // rust-openssl reports a pending BIO flush without a retry flag, so
+        // OpenSSL fails the handshake. The next read, write or
+        // `handshake_complete` sends the packet.
         match inner.poll_send_queued(cx) {
-            Poll::Ready(result) => result?,
+            Poll::Ready(result) => Poll::Ready(result),
             Poll::Pending => {
                 event!(
                     Level::DEBUG,
-                    "Deferring {} bytes of the TLS handshake",
-                    inner.out_buf.len() - inner.out_pos,
+                    "Deferring a TLS handshake packet with {} bytes unsent",
+                    inner.wr_buf.len() - inner.wr_pos,
                 );
 
-                return Poll::Ready(Ok(()));
+                Poll::Ready(Ok(()))
             }
         }
-
-        Pin::new(&mut inner.stream.as_mut().unwrap()).poll_flush(cx)
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
-        ready!(self.poll_send_queued(cx))?;
         Pin::new(&mut self.stream.as_mut().unwrap()).poll_close(cx)
     }
 }
@@ -330,6 +333,9 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
 mod tests {
     use super::*;
     use std::collections::VecDeque;
+    use std::future::Future;
+    use std::mem;
+    use std::pin::pin;
     use std::task::Waker;
 
     enum Write {
@@ -338,11 +344,15 @@ mod tests {
         Fail(io::ErrorKind),
     }
 
+    /// Writes land in `buffered` and reach `written` on flush.
     #[derive(Default)]
     struct Socket {
         writes: VecDeque<Write>,
+        pending_flushes: usize,
+        buffered: Vec<u8>,
         written: Vec<u8>,
         readable: VecDeque<u8>,
+        read_before_flush: bool,
     }
 
     impl AsyncRead for Socket {
@@ -351,6 +361,8 @@ mod tests {
             _: &mut task::Context<'_>,
             buf: &mut [u8],
         ) -> Poll<io::Result<usize>> {
+            self.read_before_flush |= !self.buffered.is_empty();
+
             if self.readable.is_empty() {
                 return Poll::Pending;
             }
@@ -378,12 +390,20 @@ mod tests {
                 Some(Write::Fail(kind)) => return Poll::Ready(Err(kind.into())),
             };
 
-            self.written.extend_from_slice(&buf[..accepted]);
+            self.buffered.extend_from_slice(&buf[..accepted]);
 
             Poll::Ready(Ok(accepted))
         }
 
-        fn poll_flush(self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+        fn poll_flush(mut self: Pin<&mut Self>, _: &mut task::Context<'_>) -> Poll<io::Result<()>> {
+            if self.pending_flushes > 0 {
+                self.pending_flushes -= 1;
+                return Poll::Pending;
+            }
+
+            let buffered = mem::take(&mut self.buffered);
+            self.written.extend(buffered);
+
             Poll::Ready(Ok(()))
         }
 
@@ -424,32 +444,48 @@ mod tests {
         Pin::new(wrapper).poll_read(&mut task::Context::from_waker(Waker::noop()), buf)
     }
 
+    fn complete(wrapper: &mut TlsPreloginWrapper<Socket>) -> Poll<io::Result<()>> {
+        pin!(wrapper.handshake_complete()).poll(&mut task::Context::from_waker(Waker::noop()))
+    }
+
     #[test]
     fn deferred_flush_sends_the_packet_before_the_next_read() {
         let mut wrapper = wrapper([Write::Pending]);
+        socket(&mut wrapper).pending_flushes = 1;
 
         assert!(matches!(write(&mut wrapper, b"hello"), Poll::Ready(Ok(5))));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
-        assert!(socket(&mut wrapper).written.is_empty());
+        assert!(socket(&mut wrapper).buffered.is_empty());
 
         socket(&mut wrapper).readable.extend(packet(b"abc"));
         let mut buf = [0u8; 16];
 
+        assert!(read(&mut wrapper, &mut buf).is_pending());
+        assert!(socket(&mut wrapper).written.is_empty());
         assert!(matches!(read(&mut wrapper, &mut buf), Poll::Ready(Ok(3))));
         assert_eq!(b"abc", &buf[..3]);
         assert_eq!(packet(b"hello"), socket(&mut wrapper).written);
+        assert!(!socket(&mut wrapper).read_before_flush);
     }
 
     #[test]
-    fn queued_packet_precedes_the_first_write_after_the_handshake() {
-        let mut wrapper = wrapper([Write::Pending]);
+    fn handshake_complete_sends_the_queued_packet() {
+        let mut wrapper = wrapper([Write::Pending, Write::Pending]);
+        socket(&mut wrapper).pending_flushes = 1;
 
         assert!(matches!(write(&mut wrapper, b"hello"), Poll::Ready(Ok(5))));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
+        assert!(complete(&mut wrapper).is_pending());
+        assert!(complete(&mut wrapper).is_pending());
+        assert!(socket(&mut wrapper).written.is_empty());
+        assert!(matches!(complete(&mut wrapper), Poll::Ready(Ok(()))));
+        assert_eq!(packet(b"hello"), socket(&mut wrapper).written);
 
-        wrapper.handshake_complete();
+        socket(&mut wrapper).pending_flushes = 1;
 
         assert!(matches!(write(&mut wrapper, b"login"), Poll::Ready(Ok(5))));
+        assert!(flush(&mut wrapper).is_pending());
+        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
 
         let mut expected = packet(b"hello");
         expected.extend_from_slice(b"login");
@@ -457,25 +493,14 @@ mod tests {
     }
 
     #[test]
-    fn next_flight_gets_its_own_header_after_a_deferred_flush() {
-        let mut wrapper = wrapper([Write::Pending]);
-
-        assert!(matches!(write(&mut wrapper, b"one"), Poll::Ready(Ok(3))));
-        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
-        assert!(matches!(write(&mut wrapper, b"second"), Poll::Ready(Ok(6))));
-        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
-
-        let mut expected = packet(b"one");
-        expected.extend(packet(b"second"));
-        assert_eq!(expected, socket(&mut wrapper).written);
-    }
-
-    #[test]
     fn repeated_handshake_flush_keeps_the_packet_queued() {
         let mut wrapper = wrapper([Write::Pending, Write::Pending]);
+        socket(&mut wrapper).pending_flushes = 1;
 
         assert!(matches!(write(&mut wrapper, b"hello"), Poll::Ready(Ok(5))));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
+        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
+        assert!(socket(&mut wrapper).buffered.is_empty());
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
         assert!(socket(&mut wrapper).written.is_empty());
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
@@ -485,9 +510,11 @@ mod tests {
     #[test]
     fn handshake_write_waits_for_the_queued_packet() {
         let mut wrapper = wrapper([Write::Pending, Write::Pending]);
+        socket(&mut wrapper).pending_flushes = 1;
 
         assert!(matches!(write(&mut wrapper, b"one"), Poll::Ready(Ok(3))));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
+        assert!(write(&mut wrapper, b"second").is_pending());
         assert!(write(&mut wrapper, b"second").is_pending());
         assert!(matches!(write(&mut wrapper, b"second"), Poll::Ready(Ok(6))));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
@@ -518,7 +545,7 @@ mod tests {
             Poll::Ready(Ok(11))
         ));
         assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
-        assert_eq!(packet(b"hello world")[..5], socket(&mut wrapper).written);
+        assert_eq!(packet(b"hello world")[..5], socket(&mut wrapper).buffered);
 
         socket(&mut wrapper).readable.extend(packet(b"abc"));
         let mut buf = [0u8; 16];
@@ -543,16 +570,14 @@ mod tests {
     }
 
     #[test]
-    fn only_a_handshake_flush_defers_a_pending_send() {
-        let mut wrapper = wrapper([Write::Pending, Write::Pending]);
+    fn zero_byte_socket_write_fails_the_flush() {
+        let mut wrapper = wrapper([Write::Accept(0)]);
 
         assert!(matches!(write(&mut wrapper, b"hello"), Poll::Ready(Ok(5))));
-        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
 
-        wrapper.handshake_complete();
-
-        assert!(flush(&mut wrapper).is_pending());
-        assert!(matches!(flush(&mut wrapper), Poll::Ready(Ok(()))));
-        assert_eq!(packet(b"hello"), socket(&mut wrapper).written);
+        match flush(&mut wrapper) {
+            Poll::Ready(Err(err)) => assert_eq!(io::ErrorKind::WriteZero, err.kind()),
+            other => panic!("expected a zero write error, got {other:?}"),
+        }
     }
 }
