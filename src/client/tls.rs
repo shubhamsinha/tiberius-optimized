@@ -301,8 +301,10 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
         }
 
         // rust-openssl reports a pending BIO flush without a retry flag, so
-        // OpenSSL fails the handshake. The next read, write or
-        // `handshake_complete` sends the packet.
+        // OpenSSL fails the handshake. The next read, write, flush or
+        // `handshake_complete` sends the packet. This can go once
+        // https://github.com/rust-openssl/rust-openssl/pull/1922 ships and
+        // OpenSSL is 3.2 or later.
         match inner.poll_send_queued(cx) {
             Poll::Ready(result) => Poll::Ready(result),
             Poll::Pending => {
