@@ -305,18 +305,11 @@ impl<S: AsyncRead + AsyncWrite + Unpin + Send> AsyncWrite for TlsPreloginWrapper
         // `handshake_complete` sends the packet. This can go once
         // https://github.com/rust-openssl/rust-openssl/pull/1922 ships and
         // OpenSSL is 3.2 or later.
-        match inner.poll_send_queued(cx) {
-            Poll::Ready(result) => Poll::Ready(result),
-            Poll::Pending => {
-                event!(
-                    Level::DEBUG,
-                    "Deferring a TLS handshake packet with {} bytes unsent",
-                    inner.wr_buf.len() - inner.wr_pos,
-                );
-
-                Poll::Ready(Ok(()))
-            }
+        if inner.poll_send_queued(cx)?.is_pending() {
+            event!(Level::DEBUG, "Deferring a TLS handshake packet");
         }
+
+        Poll::Ready(Ok(()))
     }
 
     fn poll_close(mut self: Pin<&mut Self>, cx: &mut task::Context<'_>) -> Poll<io::Result<()>> {
